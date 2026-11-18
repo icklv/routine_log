@@ -34,6 +34,8 @@
             android:value="2" />
 
         <!-- 예약 알림 + 재부팅 후 알림 유지 -->
+        <!-- 알림 버튼(먹었어요 등) 누른 걸 받는 곳 -->
+        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver" />
         <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
         <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
             <intent-filter>
