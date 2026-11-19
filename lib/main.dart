@@ -82,6 +82,18 @@ class Notifier {
     final action = r.actionId;
     final payload = r.payload;
     if (action == null || payload == null) return;
+
+    // 🎒 챙김 알림의 '다 챙겼어요'
+    if (action == 'checkAll' && payload.startsWith('check|')) {
+      final date =
+          DateTime.tryParse(payload.substring(6)) ??
+          DateUtils.dateOnly(DateTime.now());
+      final items = await CheckStore.loadItems();
+      await CheckStore.saveChecked(date, items.toSet());
+      await rescheduleAll();
+      return;
+    }
+
     final status = {
       'done': RecordStatus.done,
       'notYet': RecordStatus.notYet,
@@ -109,6 +121,31 @@ class Notifier {
     if (kIsWeb) return;
     await _android?.requestNotificationsPermission();
   }
+
+  // 챙김 알림 (버튼 1개)
+  static const _checkDetails = NotificationDetails(
+    android: AndroidNotificationDetails(
+      'check_channel',
+      '챙김 알림',
+      channelDescription: '나가기 전 챙길 것 알림',
+      importance: Importance.max,
+      priority: Priority.high,
+      actions: <AndroidNotificationAction>[
+        AndroidNotificationAction(
+          'checkAll',
+          '다 챙겼어요',
+          cancelNotification: true,
+        ),
+      ],
+    ),
+  );
+
+  static const checkMsgs = [
+    '나가기 전에 다 챙겼냐~? 🎒',
+    '또 두고 가지 말고 한 번 더 봐봐!',
+    '아따 또 놓고 나갈라고? 챙겨라잉 🎒',
+    '문 닫기 전에 가방 한 번 열어봐~',
+  ];
 
   // 복용 알림 (버튼 3개 달림)
   static const _doseDetails = NotificationDetails(
@@ -178,6 +215,30 @@ class Notifier {
         if (prevRec == null || prevRec.status != RecordStatus.done) continue;
         final t = prevRec.time.add(Duration(minutes: slot.gapMinutes));
         await _scheduleStages(i, 0, tz.TZDateTime.from(t, tz.local), slot);
+      }
+    }
+
+    // 🎒 챙김 알림 (켜져 있을 때만, 오늘 다 챙겼으면 오늘 건 빼기)
+    final (on, ch, cm) = await CheckStore.loadAlarm();
+    final items = await CheckStore.loadItems();
+    if (on && items.isNotEmpty) {
+      final todayChecked = await CheckStore.loadChecked(today);
+      final allDone = items.every(todayChecked.contains);
+      final nowTz = tz.TZDateTime.now(tz.local);
+      for (int day = 0; day < 14; day++) {
+        if (day == 0 && allDone) continue;
+        final d = today.add(Duration(days: day));
+        final when = tz.TZDateTime(tz.local, d.year, d.month, d.day, ch, cm);
+        if (!when.isAfter(nowTz)) continue;
+        await plugin.zonedSchedule(
+          900000 + day,
+          checkMsgs[_rand.nextInt(checkMsgs.length)],
+          items.join(' · '),
+          when,
+          _checkDetails,
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+          payload: 'check|${dateStr(d)}',
+        );
       }
     }
   }
@@ -515,6 +576,48 @@ class MoodStore {
         jsonEncode({'level': m.level, 'memo': m.memo}),
       );
     }
+  }
+}
+
+// 챙김 체크 (챙길 목록 + 날짜별 체크한 것)
+class CheckStore {
+  static const defaults = ['폰', '지갑', '열쇠', '약', '이어폰'];
+
+  static Future<List<String>> loadItems() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList('check_items') ?? List<String>.from(defaults);
+  }
+
+  static Future<void> saveItems(List<String> items) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('check_items', items);
+  }
+
+  // 챙김 알림 (켜짐, 시, 분)
+  static Future<(bool, int, int)> loadAlarm() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (
+      prefs.getBool('check_alarm_on') ?? false,
+      prefs.getInt('check_alarm_h') ?? 8,
+      prefs.getInt('check_alarm_m') ?? 30,
+    );
+  }
+
+  static Future<void> saveAlarm(bool on, int h, int m) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('check_alarm_on', on);
+    await prefs.setInt('check_alarm_h', h);
+    await prefs.setInt('check_alarm_m', m);
+  }
+
+  static Future<Set<String>> loadChecked(DateTime d) async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList('check_${dateStr(d)}') ?? []).toSet();
+  }
+
+  static Future<void> saveChecked(DateTime d, Set<String> checked) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('check_${dateStr(d)}', checked.toList());
   }
 }
 
@@ -900,6 +1003,8 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
   Map<String, DoseRecord> records = {};
   MoodRecord? mood;
   bool periodToday = false;
+  List<String> checkItems = [];
+  Set<String> checked = {};
   bool loading = true;
 
   DateTime get today => DateUtils.dateOnly(DateTime.now());
@@ -939,11 +1044,15 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
     }
     final m = await MoodStore.load(today);
     final pd = await PeriodStore.isOn(today);
+    final ci = await CheckStore.loadItems();
+    final cc = await CheckStore.loadChecked(today);
     setState(() {
       slots = s;
       records = r;
       mood = m;
       periodToday = pd;
+      checkItems = ci;
+      checked = cc.where(ci.contains).toSet();
       loading = false;
     });
     Notifier.rescheduleAll();
@@ -1132,7 +1241,12 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
               SizedBox(height: 16),
               for (int i = 0; i < slots.length; i++) _slotCard(i),
             ],
-            if (!loading) ...[SizedBox(height: 6), _moodCard()],
+            if (!loading) ...[
+              SizedBox(height: 6),
+              _checkCard(),
+              SizedBox(height: 14),
+              _moodCard(),
+            ],
           ],
         ),
       ),
@@ -1169,6 +1283,335 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+  }
+
+  // 🎒 챙김 체크 카드
+  Widget _checkCard() {
+    final done = checkItems.isNotEmpty && checked.length == checkItems.length;
+    return Container(
+      padding: EdgeInsets.fromLTRB(18, 12, 8, 18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: done ? AppColors.pink : AppColors.beige,
+          width: 1.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('🎒', style: TextStyle(fontSize: 22)),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '오늘 챙김',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: AppColors.brown,
+                  ),
+                ),
+              ),
+              Text(
+                '${checked.length}/${checkItems.length}',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.brownLight,
+                ),
+              ),
+              IconButton(
+                tooltip: '챙길 것 편집',
+                icon: Icon(
+                  Icons.edit_outlined,
+                  size: 20,
+                  color: AppColors.brownLight,
+                ),
+                onPressed: openCheckEditor,
+              ),
+            ],
+          ),
+          if (checkItems.isEmpty)
+            Text(
+              '연필 눌러서 챙길 거 추가하기',
+              style: TextStyle(fontSize: 14, color: AppColors.brownLight),
+            )
+          else
+            Padding(
+              padding: EdgeInsets.only(right: 10),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final item in checkItems)
+                    GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          checked.contains(item)
+                              ? checked.remove(item)
+                              : checked.add(item);
+                        });
+                        CheckStore.saveChecked(
+                          today,
+                          checked,
+                        ).then((_) => Notifier.rescheduleAll());
+                      },
+                      child: AnimatedContainer(
+                        duration: Duration(milliseconds: 150),
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: checked.contains(item)
+                              ? AppColors.pink
+                              : AppColors.pinkSoft,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              checked.contains(item)
+                                  ? Icons.check_circle
+                                  : Icons.radio_button_unchecked,
+                              size: 18,
+                              color: checked.contains(item)
+                                  ? Colors.white
+                                  : AppColors.brownLight,
+                            ),
+                            SizedBox(width: 6),
+                            Text(
+                              item,
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: checked.contains(item)
+                                    ? Colors.white
+                                    : AppColors.brown,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          if (done) ...[
+            SizedBox(height: 12),
+            Text(
+              '다 챙겼어요! 이제 출발~ 🚶',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: AppColors.pink,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // 챙길 목록 편집 창
+  Future<void> openCheckEditor() async {
+    final items = List<String>.from(checkItems);
+    final ctrl = TextEditingController();
+    var (alarmOn, alarmH, alarmM) = await CheckStore.loadAlarm();
+    if (!mounted) return;
+
+    final saved = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.cream,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          void add() {
+            final t = ctrl.text.trim();
+            if (t.isEmpty || items.contains(t)) return;
+            setSheet(() {
+              items.add(t);
+              ctrl.clear();
+            });
+          }
+
+          return Padding(
+            padding: EdgeInsets.fromLTRB(
+              24,
+              24,
+              24,
+              MediaQuery.of(ctx).viewInsets.bottom + 28,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '🎒 챙길 것',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: AppColors.brown,
+                  ),
+                ),
+                SizedBox(height: 16),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: ctrl,
+                        onSubmitted: (_) => add(),
+                        decoration: InputDecoration(
+                          hintText: '예: 사원증, 우산, 텀블러',
+                          filled: true,
+                          fillColor: Colors.white,
+                          isDense: true,
+                          contentPadding: EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 14,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(width: 8),
+                    GestureDetector(
+                      onTap: add,
+                      child: Container(
+                        padding: EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: AppColors.pink,
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Icon(Icons.add, color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
+                SizedBox(height: 14),
+                if (items.isEmpty)
+                  Text(
+                    '아직 없어요',
+                    style: TextStyle(fontSize: 13, color: AppColors.brownLight),
+                  )
+                else
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final it in items)
+                        medChip(
+                          it,
+                          onDelete: () => setSheet(() => items.remove(it)),
+                        ),
+                    ],
+                  ),
+                SizedBox(height: 18),
+                // 🔔 나가기 전 알림
+                Container(
+                  padding: EdgeInsets.fromLTRB(16, 6, 8, 6),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Row(
+                    children: [
+                      Text('🔔', style: TextStyle(fontSize: 18)),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: !alarmOn
+                              ? null
+                              : () async {
+                                  final t = await showTimePicker(
+                                    context: ctx,
+                                    initialTime: TimeOfDay(
+                                      hour: alarmH,
+                                      minute: alarmM,
+                                    ),
+                                  );
+                                  if (t != null) {
+                                    setSheet(() {
+                                      alarmH = t.hour;
+                                      alarmM = t.minute;
+                                    });
+                                  }
+                                },
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '나가기 전 알림',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  color: AppColors.brown,
+                                ),
+                              ),
+                              Text(
+                                alarmOn
+                                    ? '매일 ${timeTextHM(alarmH, alarmM)} (눌러서 변경)'
+                                    : '꺼져 있어요',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: AppColors.brownLight,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Switch(
+                        value: alarmOn,
+                        activeColor: AppColors.pink,
+                        onChanged: (v) => setSheet(() => alarmOn = v),
+                      ),
+                    ],
+                  ),
+                ),
+                SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.pink,
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                    ),
+                    onPressed: () {
+                      add(); // 입력칸에 남은 것도 추가
+                      Navigator.pop(ctx, true);
+                    },
+                    child: Text('저장하기', style: TextStyle(fontSize: 16)),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+
+    if (saved == true) {
+      await CheckStore.saveItems(items);
+      await CheckStore.saveAlarm(alarmOn, alarmH, alarmM);
+      checked = checked.where(items.contains).toSet();
+      await CheckStore.saveChecked(today, checked);
+      setState(() => checkItems = items);
+      Notifier.rescheduleAll();
+    }
   }
 
   Widget _moodCard() {
